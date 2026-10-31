@@ -1,28 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep the optional credential out of child-process environments
-cmc_api_key="${COINMARKETCAP_API_KEY:-}"
-export -n cmc_api_key
-unset COINMARKETCAP_API_KEY
+# Select link formatting before command substitutions redirect stdout
+if [[ -t 1 && -z "${NO_COLOR+x}" ]]; then
+    format() {
+        local url="$1"
+        shift
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\\n' "$url" "$*"
+    }
+else
+    format() {
+        local url="$1"
+        shift
+        printf '[%s](%s)\n' "$*" "$url"
+    }
+fi
 
 # Configuration and argument validation
 ACCOUNT="${1:-}"
-PRICE_DATE_ARG="${2:-}" # Optional: YYMMDD (for example, 261011)
+PRICE_DATE_ARG="${2:-}" # Optional: now or YYMMDD
 
-if [[ -z "$ACCOUNT" ]]; then
-    echo "Usage: $0 <account.near> [YYMMDD]" >&2
+if [[ -z "$ACCOUNT" || $# -gt 2 ]]; then
+    echo "Usage: $0 <account.near> [now|YYMMDD]" >&2
     exit 1
 fi
 
-# Validate explicit dates even when pricing is disabled
-if (( $# >= 2 )); then
-    if [[ -z "$cmc_api_key" ]]; then
-        echo "Warning: set COINMARKETCAP_API_KEY to display the price for the requested date" >&2
-    fi
-
+# Only completed UTC days have closing prices
+if (( $# >= 2 )) && [[ "$PRICE_DATE_ARG" != now ]]; then
     if [[ ! "$PRICE_DATE_ARG" =~ ^[0-9]{6}$ ]]; then
-        echo "Error: price date must use YYMMDD format" >&2
+        echo "Error: price date must be now or use YYMMDD format" >&2
         exit 1
     fi
 
@@ -45,6 +51,71 @@ if ! NEAR_BIN=$(type -P near); then
     echo "Error: install the required near-cli-rs as described in the README" >&2
     exit 1
 fi
+
+# Retry failed or invalid reads five times with a two second pause
+retry_read() {
+    local attempt result
+    for ((attempt=1; attempt<=5; attempt++)); do
+        if result=$("$@" 2>/dev/null); then
+            printf '%s\n' "$result"
+            return 0
+        fi
+        if (( attempt < 5 )); then sleep 2; fi
+    done
+    return 1
+}
+
+# Accept cache records only for this account and network
+read_history() {
+    jq -e --arg account "$ACCOUNT" '
+        select(.version == 1 and .network == "mainnet" and .account == $account) |
+        .snapshots | select(type == "array") |
+        select(all(.[];
+            (.height | type == "number" and . > 0 and floor == .) and
+            (.timestamp | type == "number" and . > 0 and floor == .) and
+            (.hash | type == "string" and test("^[1-9A-HJ-NP-Za-km-z]{32,48}$")) and
+            (.balance | type == "string" and test("^[0-9]+([.][0-9]+)?$")) and
+            (.balance | tonumber | isfinite and . >= 0)))' "$HISTORY_FILE" 2>/dev/null
+}
+
+# Atomically preserve recent verified snapshots without making cache writes mandatory
+save_history() (
+    umask 077
+    local snapshots temporary
+    mkdir -p "$HISTORY_DIR" || return 1
+    snapshots=$(read_history) || snapshots='[]'
+    temporary=$(mktemp "$HISTORY_DIR/.history-XXXXXX") || return 1
+    trap 'rm -f "$temporary"' EXIT
+    jq -n --arg account "$ACCOUNT" --argjson snapshots "$snapshots" \
+        --argjson height "$1" --argjson timestamp "$2" --arg hash "$3" --arg balance "$4" '
+        {version:1, network:"mainnet", account:$account,
+         snapshots: (($snapshots + [{height:$height,timestamp:$timestamp,hash:$hash,balance:$balance}]) |
+            unique_by(.height) | sort_by(.timestamp) |
+            . as $all | map(select(.timestamp >= ($all[-1].timestamp - 31*86400))) | if length > 64 then [.[0]] + .[-63:] else . end)}
+    ' > "$temporary" || return 1
+    mv -f "$temporary" "$HISTORY_FILE"
+)
+
+# Fetch and validate one historical snapshot before allowing it into the cache
+fetch_history() {
+    local info height timestamp hash raw clean total
+    info=$(historical_block "$((CURRENT_TS - 30 * 86400))" "$BLOCK_NUM") || return 1
+    read -r height timestamp hash <<< "$info"
+    raw=$(timeout 20 "$NEAR_BIN" account view-account-summary "$ACCOUNT" network-config mainnet at-block-height "$height" 2>&1) || return 1
+    clean=$(printf '%s\n' "$raw" | clean_summary) || return 1
+    [[ "$clean" == *"At block #$height"* && "$clean" == *"($hash)"* ]] || return 1
+    total=$(complete_balance "$clean" "$height") || return 1
+    printf '%s\t%s\t%s\t%s\n' "$height" "$timestamp" "$hash" "$total"
+}
+
+# Verify the current block before using its timestamp for cache selection
+current_block() {
+    local info height timestamp hash
+    info=$(block_info "$BLOCK_NUM") || return 1
+    read -r height timestamp hash <<< "$info"
+    [[ "$height" == "$BLOCK_NUM" && "$hash" == "$BLOCK_HASH" && "$timestamp" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$info"
+}
 
 # Read-only helpers for complete balances and historical block discovery
 clean_summary() {
@@ -72,7 +143,7 @@ complete_balance() {
     total=$(printf '%s\n' "$summary" | base_balance) || return 1
     while IFS= read -r pool; do
         [[ -n "$pool" ]] || continue
-        amount=$("$NEAR_BIN" --quiet contract call-function as-read-only "$pool" \
+        amount=$(timeout 20 "$NEAR_BIN" --quiet contract call-function as-read-only "$pool" \
             get_account_total_balance json-args "$ACCOUNT_ARGS" \
             network-config mainnet at-block-height "$height" 2>/dev/null) || return 1
         amount=$(printf '%s' "$amount" | jq -er 'select(type == "string" and test("^[0-9]+$"))') || return 1
@@ -123,7 +194,7 @@ historical_block() {
 }
 
 # 2 Query a current summary, then pin all pool queries to the same block
-for dependency in curl jq; do
+for dependency in curl jq timeout; do
     if ! command -v "$dependency" >/dev/null; then
         echo "Error: $dependency is required" >&2
         exit 1
@@ -179,101 +250,96 @@ DAILY_GAIN='N/A'
 ANNUAL_GAIN='N/A'
 APY='N/A'
 NOW_EPOCH=$(date -u +%s)
-if CURRENT_INFO=$(block_info "$BLOCK_NUM" 2>/dev/null) && [[ -n "$CURRENT_INFO" ]]; then
+HISTORY_DIR="$HOME/.near-balance"
+# Encode the account to prevent cache paths from escaping the cache directory
+HISTORY_FILE="$HISTORY_DIR/$(jq -rn --arg account "$ACCOUNT" '$account | @uri')-history.json"
+if CURRENT_INFO=$(retry_read current_block); then
     read -r CURRENT_HEIGHT CURRENT_TS CURRENT_HASH <<< "$CURRENT_INFO"
-    if [[ "$CURRENT_HEIGHT" == "$BLOCK_NUM" && "$CURRENT_HASH" == "$BLOCK_HASH" && "$CURRENT_TS" =~ ^[0-9]+$ ]]; then
-        NOW_EPOCH="$CURRENT_TS"
-        if OLD_INFO=$(historical_block "$((CURRENT_TS - 30 * 86400))" "$BLOCK_NUM"); then
-            read -r OLD_HEIGHT OLD_TS OLD_HASH <<< "$OLD_INFO"
-            if OLD_RAW=$("$NEAR_BIN" account view-account-summary "$ACCOUNT" network-config mainnet at-block-height "$OLD_HEIGHT" 2>&1) &&
-                OLD_CLEAN=$(printf '%s\n' "$OLD_RAW" | clean_summary) &&
-                [[ "$OLD_CLEAN" == *"At block #$OLD_HEIGHT"* && "$OLD_CLEAN" == *"($OLD_HASH)"* ]] &&
-                OLD_TOTAL=$(complete_balance "$OLD_CLEAN" "$OLD_HEIGHT" 2>/dev/null); then
-                ELAPSED=$((CURRENT_TS - OLD_TS))
-                if GROWTH=$(awk -v current="$TOTAL_NEAR" -v previous="$OLD_TOTAL" -v dt="$ELAPSED" '
-                    BEGIN {
-                        if (previous <= 0 || current < 0 || dt < 30*86400 || dt > 31*86400) exit 1
-                        if (current == 0) { print "0.0000 0.00 -100.00"; exit }
-                        rate = log(current / previous) / dt
-                        if (rate * 365 * 86400 > 600) exit 1
-                        daily = current * (exp(rate * 86400) - 1)
-                        annual_rate = exp(rate * 365 * 86400) - 1
-                        printf "%+.4f %+.2f %.2f\n", daily, current * annual_rate, 100 * annual_rate
-                    }'); then
-                    read -r DAILY_GAIN ANNUAL_GAIN APY <<< "$GROWTH"
-                    DAILY_GAIN="$DAILY_GAIN \$NEAR"
-                    ANNUAL_GAIN="$ANNUAL_GAIN \$NEAR"
-                    APY="$APY%"
-                fi
-            fi
+    NOW_EPOCH="$CURRENT_TS"
+    OLD_INFO=$(read_history | jq -er --argjson now "$CURRENT_TS" '
+        map(select(.timestamp <= $now - 30*86400 and .timestamp >= $now - 31*86400)) |
+        max_by(.timestamp) | select(. != null) |
+        [.height,.timestamp,.hash,.balance] | @tsv') || OLD_INFO=''
+    if [[ -z "$OLD_INFO" ]]; then
+        OLD_INFO=$(retry_read fetch_history) || OLD_INFO=''
+    fi
+    if [[ -n "$OLD_INFO" ]]; then
+        read -r OLD_HEIGHT OLD_TS OLD_HASH OLD_TOTAL <<< "$OLD_INFO"
+        save_history "$OLD_HEIGHT" "$OLD_TS" "$OLD_HASH" "$OLD_TOTAL" 2>/dev/null || true
+        ELAPSED=$((CURRENT_TS - OLD_TS))
+        if GROWTH=$(awk -v current="$TOTAL_NEAR" -v previous="$OLD_TOTAL" -v dt="$ELAPSED" '
+            BEGIN {
+                if (previous <= 0 || current < 0 || dt < 30*86400 || dt > 31*86400) exit 1
+                if (current == 0) { print "0.0000 0.00 -100.00"; exit }
+                rate = log(current / previous) / dt
+                if (rate * 365 * 86400 > 600) exit 1
+                daily = current * (exp(rate * 86400) - 1)
+                annual_rate = exp(rate * 365 * 86400) - 1
+                printf "%+.4f %+.2f %.2f\n", daily, current * annual_rate, 100 * annual_rate
+            }'); then
+            read -r DAILY_GAIN ANNUAL_GAIN APY <<< "$GROWTH"
+            DAILY_GAIN="$DAILY_GAIN \$NEAR"
+            ANNUAL_GAIN="$ANNUAL_GAIN \$NEAR"
+            APY="$APY%"
         fi
     fi
+    save_history "$CURRENT_HEIGHT" "$CURRENT_TS" "$CURRENT_HASH" "$TOTAL_NEAR" 2>/dev/null || true
 fi
 NOW_STR=$(LC_ALL=C date -u -d "@$NOW_EPOCH" '+%b %d, %Y %H:%M:%S UTC')
 
-# 4 Fetch the NEAR closing price from the CoinMarketCap API
-if [[ -n "${cmc_api_key:-}" ]]; then
+# 4 Fetch the public Coinbase NEAR USD ticker or completed daily candle
+PRICE_API='https://api.exchange.coinbase.com/products/NEAR-USD'
+if [[ "$PRICE_DATE_ARG" == now ]]; then
+    PRICE_LABEL='current price'
+    if ! PRICE_RESPONSE=$(curl -fsS --connect-timeout 5 --max-time 20 "$PRICE_API/ticker"); then
+        echo 'Error: could not request the current NEAR USD price from Coinbase' >&2
+        exit 1
+    fi
+    if ! PRICE=$(printf '%s' "$PRICE_RESPONSE" | jq -er '
+        .price | select(type == "string") |
+        select(test("^[0-9]+(\\.[0-9]+)?$")) |
+        tonumber | select(. > 0 and isfinite)
+    ' 2>/dev/null); then
+        echo 'Error: Coinbase did not return a valid current NEAR USD price' >&2
+        exit 1
+    fi
+else
     if [[ -z "$PRICE_DATE_ARG" ]]; then
-        TARGET_ISO=$(LC_ALL=C date -u -d "yesterday" "+%Y-%m-%d")
+        TARGET_ISO=$(LC_ALL=C date -u -d yesterday +%Y-%m-%d)
     fi
-
-    TARGET_LABEL=$(LC_ALL=C date -u -d "$TARGET_ISO" "+%b %d")
-    TIME_START="${TARGET_ISO}T00:00:00Z"
-    TIME_END="${TARGET_ISO}T23:59:59Z"
-
-    # Read the header from stdin so the key never appears in curl arguments
-    if [[ "$cmc_api_key" == *$'\r'* || "$cmc_api_key" == *$'\n'* ]]; then
-        echo "Error: invalid CoinMarketCap API key" >&2
+    TARGET_EPOCH=$(LC_ALL=C date -u -d "$TARGET_ISO" +%s)
+    TIME_END=$(LC_ALL=C date -u -d "$TARGET_ISO +1 day" +%Y-%m-%d)
+    TARGET_LABEL=$(LC_ALL=C date -u -d "$TARGET_ISO" '+%b %d, %Y UTC')
+    PRICE_LABEL="close price at $TARGET_LABEL"
+    if ! PRICE_RESPONSE=$(curl -fsS --connect-timeout 5 --max-time 20 -G "$PRICE_API/candles" \
+        --data-urlencode "granularity=86400" \
+        --data-urlencode "start=${TARGET_ISO}T00:00:00Z" \
+        --data-urlencode "end=${TIME_END}T00:00:00Z"); then
+        echo "Error: could not request the NEAR closing price for $TARGET_ISO UTC from Coinbase" >&2
         exit 1
     fi
-
-    # Try historical OHLCV first (requires a paid CMC plan)
-    CMC_HIST=$(curl -sS -G "https://pro-api.coinmarketcap.com/v2/cryptocurrency/ohlcv/historical" \
-        -H @- \
-        --data-urlencode "symbol=NEAR" \
-        --data-urlencode "time_start=${TIME_START}" \
-        --data-urlencode "time_end=${TIME_END}" \
-        --data-urlencode "convert=USD" <<< "X-CMC_PRO_API_KEY: $cmc_api_key" || true)
-
-    CLOSE_PRICE=$(printf "%s" "$CMC_HIST" | jq -r '
-        (.. | objects | select(has("close")) | .close) // empty
-    ' 2>/dev/null | head -n 1)
-
-    # Fall back to quotes/latest for the free CMC Basic plan
-    if [[ -z "$CLOSE_PRICE" || "$CLOSE_PRICE" == "null" ]]; then
-        CMC_LATEST=$(curl -sS -G "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest" \
-            -H @- \
-            --data-urlencode "symbol=NEAR" \
-            --data-urlencode "convert=USD" <<< "X-CMC_PRO_API_KEY: $cmc_api_key")
-
-        CLOSE_PRICE=$(printf "%s" "$CMC_LATEST" | jq -r '
-            .data.NEAR[0].quote.USD.price // .data.NEAR.quote.USD.price // empty
-        ')
-    fi
-
-    if [[ -z "$CLOSE_PRICE" || "$CLOSE_PRICE" == "null" ]]; then
-        echo "Error: could not retrieve the NEAR price from CoinMarketCap API" >&2
+    if ! PRICE=$(printf '%s' "$PRICE_RESPONSE" | jq -er --argjson timestamp "$TARGET_EPOCH" '
+        select(type == "array") |
+        [.[] | select(type == "array") | select(.[0] == $timestamp)] |
+        select(length == 1) | .[0] | select(length == 6) |
+        .[4] | select(type == "number" and . > 0 and isfinite)
+    ' 2>/dev/null); then
+        echo "Error: Coinbase did not return a valid NEAR USD daily close for $TARGET_ISO UTC" >&2
         exit 1
     fi
-
-    PRICE_FMT=$(awk -v p="$CLOSE_PRICE" 'BEGIN { printf "%.4f", p }')
-    USD_TOTAL=$(awk -v b="$TOTAL_NEAR" -v p="$CLOSE_PRICE" 'BEGIN { printf "%.0f", b * p }')
-
 fi
+PRICE_FMT=$(awk -v p="$PRICE" 'BEGIN { printf "%.4f", p }')
+USD_TOTAL=$(awk -v b="$TOTAL_NEAR" -v p="$PRICE" 'BEGIN { printf "%.0f", b * p }')
 
 # 5 Format the final report
 cat <<EOF
-${NOW_STR} At block [#${BLOCK_NUM} ${BLOCK_HASH}] (https://nearblocks.io/blocks/${BLOCK_NUM})
+${NOW_STR} At block $(format "https://nearblocks.io/blocks/${BLOCK_NUM}" "#${BLOCK_NUM} ${BLOCK_HASH}")
 
 ${TOTAL_NEAR} \$NEAR ${NOW_STR}
 
 Daily Gain  ${DAILY_GAIN}
 Annual Gain ${ANNUAL_GAIN}
 APY         ${APY}
-EOF
-if [[ -n "${cmc_api_key:-}" ]]; then
-cat <<EOF
 
-~\$${USD_TOTAL} [by \$${PRICE_FMT} close price at ${TARGET_LABEL}](https://coinmarketcap.com/currencies/near-protocol/historical-data/)
+~\$${USD_TOTAL} $(format "https://www.coinbase.com/price/near-protocol" "by \$${PRICE_FMT} ${PRICE_LABEL} on Coinbase")
 EOF
-fi

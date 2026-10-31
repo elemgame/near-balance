@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf "%s\n" "$*" >> "$BATS_TEST_TMPDIR/sleep.calls"

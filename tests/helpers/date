@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Freeze the default price day without changing other date operations
+if [[ -n "${TEST_TODAY:-}" && "$*" == '-u -d yesterday +%Y-%m-%d' ]]; then
+    command -p date -u -d "$TEST_TODAY -1 day" +%Y-%m-%d
+else
+    command -p date "$@"
+fi

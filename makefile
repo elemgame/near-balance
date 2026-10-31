@@ -12,4 +12,4 @@ test:
 
 .PHONY: toolchain
 toolchain:
-	sudo apt-get update && sudo apt-get install -y shellcheck bats jq
+	sudo apt-get update && sudo apt-get install -y shellcheck bats jq util-linux

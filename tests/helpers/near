@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -eu
-[[ -z "${COINMARKETCAP_API_KEY+x}" ]] || exit 95
 printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/near.calls"
 if [[ "$*" == *'config show-connections'* ]]; then
     [[ "${CONFIG_READ_FAILURE:-}" != 1 ]] || exit 1
@@ -34,6 +33,15 @@ height=222385340
 native="${CURRENT_NATIVE:-12.5}"
 validator="${CURRENT_VALIDATOR:-1}"
 if [[ "$*" == *at-block-height* ]]; then
+    if [[ -n "${HISTORY_FAIL_COUNT:-}" ]]; then
+        attempts=0
+        if [[ -f "$BATS_TEST_TMPDIR/history.attempts" ]]; then
+            read -r attempts < "$BATS_TEST_TMPDIR/history.attempts"
+        fi
+        attempts=$((attempts + 1))
+        printf '%s\n' "$attempts" > "$BATS_TEST_TMPDIR/history.attempts"
+        if (( attempts <= HISTORY_FAIL_COUNT )); then exit 1; fi
+    fi
     [[ "${HISTORICAL_FAILURE:-}" != 1 ]] || exit 1
     height="${*: -1}"
     native="${OLD_NATIVE:-12.3}"
