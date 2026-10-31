@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+[[ -z "${COINMARKETCAP_API_KEY+x}" ]] || exit 95
+cat <<'REPORT'
+example.near At block #222385340
+(3LbJoQaZCUskZYKfeUoDMbxEqH4pvp3rmmY4avdKvE8G)
+Native account balance 12.5 NEAR
+Validator stake 1 NEAR
+Delegated stake with <pool.near> 6.5 NEAR
+REPORT

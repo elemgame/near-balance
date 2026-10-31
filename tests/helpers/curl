@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+[[ -z "${COINMARKETCAP_API_KEY+x}" ]] || exit 91
+[[ "$*" != *test-key* ]] || exit 92
+[[ "$*" == *'-H @-'* ]] || exit 93
+IFS= read -r header
+[[ "$header" == 'X-CMC_PRO_API_KEY: test-key' ]] || exit 94
+printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/curl.calls"
+if [[ "$*" == *ohlcv* ]]; then
+    if [[ -n "${HISTORY_RESPONSE:-}" ]]; then
+        printf '%s\n' "$HISTORY_RESPONSE"
+    else
+        printf '%s\n' '{"data":{"close":2}}'
+    fi
+else
+    printf '%s\n' '{"data":{"NEAR":[{"quote":{"USD":{"price":3}}}]}}'
+fi
