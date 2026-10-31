@@ -1,9 +1,49 @@
 #!/usr/bin/env bash
+set -eu
 [[ -z "${COINMARKETCAP_API_KEY+x}" ]] || exit 95
-cat <<'REPORT'
-example.near At block #222385340
+printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/near.calls"
+if [[ "$*" == *'config show-connections'* ]]; then
+    [[ "${CONFIG_READ_FAILURE:-}" != 1 ]] || exit 1
+    rpc="${CONFIG_RPC-https://archival-rpc.mainnet.fastnear.com/}"
+    if [[ -f "$BATS_TEST_TMPDIR/config.rpc" ]]; then
+        rpc=$(cat "$BATS_TEST_TMPDIR/config.rpc")
+    fi
+    cat >&2 <<CONFIG
+[network_connection.testnet]
+rpc_url = "https://archival-rpc.testnet.fastnear.com/"
+[network_connection.mainnet]
+rpc_url = "$rpc"
+[network_connection.mainnet-fastnear]
+rpc_url = "https://rpc.mainnet.fastnear.com/"
+CONFIG
+    exit
+fi
+if [[ "$*" == *'config edit-connection'* ]]; then
+    [[ "${CONFIG_WRITE_FAILURE:-}" != 1 ]] || exit 1
+    [[ "$*" == '--quiet config edit-connection mainnet --key rpc_url --value https://archival-rpc.mainnet.fastnear.com/' ]] || exit 96
+    printf '%s\n' "${*: -1}" > "$BATS_TEST_TMPDIR/config.rpc"
+    exit
+fi
+if [[ "$*" == *get_account_total_balance* ]]; then
+    [[ "${POOL_QUERY_FAILURE:-}" != 1 ]] || exit 1
+    # Include unstaked funds in the same total as active stake
+    printf '"%s"\n' "${POOL_TOTAL_YOCTO:-6500000000000000000000000}"
+    exit
+fi
+height=222385340
+native="${CURRENT_NATIVE:-12.5}"
+validator="${CURRENT_VALIDATOR:-1}"
+if [[ "$*" == *at-block-height* ]]; then
+    [[ "${HISTORICAL_FAILURE:-}" != 1 ]] || exit 1
+    height="${*: -1}"
+    native="${OLD_NATIVE:-12.3}"
+    validator="${OLD_VALIDATOR:-1}"
+    if [[ "${WRONG_OLD_BLOCK:-}" == 1 ]]; then height=1; fi
+fi
+cat >&2 <<REPORT
+example.near At block #$height
 (3LbJoQaZCUskZYKfeUoDMbxEqH4pvp3rmmY4avdKvE8G)
-Native account balance 12.5 NEAR
-Validator stake 1 NEAR
+Native account balance $native NEAR
+Validator stake $validator NEAR
 Delegated stake with <pool.near> 6.5 NEAR
 REPORT

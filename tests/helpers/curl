@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
+set -eu
+[[ -z "${COINMARKETCAP_API_KEY+x}" ]] || exit 91
+if [[ "$*" == *api.fastnear.com/v1/account/* ]]; then
+    if [[ "${POOL_DISCOVERY_FAILURE:-}" == 1 ]]; then exit 1; fi
+    if [[ "${NO_POOLS:-}" == 1 ]]; then
+        printf '%s\n' '{"account_id":"example.near","pools":[]}'
+        exit
+    fi
+    printf '%s\n' '{"account_id":"example.near","pools":[{"pool_id":"pool.near"}]}'
+    exit
+fi
+if [[ "$*" == *archival-rpc.mainnet.fastnear.com* ]]; then
+    if [[ "${RPC_FAILURE:-}" == 1 ]]; then exit 1; fi
+    while [[ "$1" != --data ]]; do shift; done
+    height=$(printf '%s' "$2" | jq -r '.params.block_id')
+    printf '%s\n' "$height" >> "$BATS_TEST_TMPDIR/blocks.calls"
+    if [[ "${SKIPPED_BLOCK:-}" == 1 && "$height" == 111192670 ]]; then
+        printf '%s\n' '{"error":{"cause":{"name":"UNKNOWN_BLOCK"}}}'
+        exit
+    fi
+    timestamp=$((1793400000 - (222385340 - height) * ${BLOCK_SECONDS:-1}))
+    jq -cn --argjson height "$height" --arg timestamp "${timestamp}000000000" \
+        '{result:{header:{height:$height,timestamp_nanosec:$timestamp,hash:"3LbJoQaZCUskZYKfeUoDMbxEqH4pvp3rmmY4avdKvE8G"}}}'
+    exit
+fi
 [[ -z "${COINMARKETCAP_API_KEY+x}" ]] || exit 91
 [[ "$*" != *test-key* ]] || exit 92
 [[ "$*" == *'-H @-'* ]] || exit 93
