@@ -652,3 +652,30 @@ flow_response() {
     [[ "$output" == *'APY         0.00%'* ]]
     [[ "$(cat "$BATS_TEST_TMPDIR/flows.calls")" == *cursor=123* ]]
 }
+
+@test "successful self deletion makes all growth estimates unavailable" {
+    seed_flow_history
+    export CURRENT_NATIVE=0 CURRENT_VALIDATOR=0 POOL_TOTAL_YOCTO=0
+    FLOW_RESPONSE=$(flow_response 0 example.near example.near | jq '
+        .txns[0].actions=[{action:"DELETE_ACCOUNT",args:{beneficiary_id:"recipient.near"}}]')
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near now
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'Daily Gain  N/A'* ]]
+    [[ "$output" == *'Annual Gain N/A'* ]]
+    [[ "$output" == *'APY         N/A'* ]]
+    [[ "$output" == *'current price on Coinbase'* ]]
+}
+
+@test "failed or out of interval self deletion does not invalidate growth" {
+    seed_flow_history
+    export CURRENT_NATIVE=12.5
+    for change in '.txns[0].receipt_outcome.status=false' '.txns[0].receipt_block.block_height=219793340' '.txns[0].receipt_block.block_height=222385341'; do
+        FLOW_RESPONSE=$(flow_response 0 example.near example.near | jq '
+            .txns[0].actions=[{action:"DELETE_ACCOUNT"}]' | jq "$change")
+        export FLOW_RESPONSE
+        run bash "$SCRIPT" example.near
+        [ "$status" -eq 0 ]
+        [[ "$output" == *'APY         0.00%'* ]]
+    done
+}

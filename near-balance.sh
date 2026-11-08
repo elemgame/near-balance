@@ -232,11 +232,11 @@ JQ
                 ($pools | split("\n")) as $internal |
                 [.[] | select(.receipt_block.block_height > $start and .receipt_block.block_height <= $end) |
                     select(.receipt_outcome.status) |
+                    if any(.actions[]; .action == "DELETE_ACCOUNT") then error("Unsupported account deletion") else . end |
                     . as $receipt |
                     (if .predecessor_account_id == $account then .receiver_account_id else .predecessor_account_id end) as $other |
                     select($other != $account and $other != "system" and ($internal | index($other) | not)) |
                     .actions[] |
-                    if .action == "DELETE_ACCOUNT" then error("Unsupported account deletion") else . end |
                     select(.action == "TRANSFER" or .action == "FUNCTION_CALL") |
                     {amount: (.deposit / 1e24 * (if $receipt.receiver_account_id == $account then 1 else -1 end)),
                      time: ($receipt.receipt_block.block_timestamp / 1e9)}] |
