@@ -4,24 +4,9 @@ See [readme.md](readme.md) for installation and usage
 
 ## Checks and pull requests
 
-Requires util-linux `script` for terminal tests, ShellCheck, jq, and [bats-core](https://github.com/bats-core/bats-core) 1.5.0+
-
 ```sh
-# Install tools through sudo apt-get on Debian or Ubuntu
-make toolchain
-make lint
-make test
-# Run both checks
-make qa
+make quality-bash
 ```
-
-Add regression tests in `tests/report.bats` with offline command stubs in `tests/helpers/`
-
-Tests use temporary state without changing real configuration
-
-CI runs `Lint and test` on main pushes and non-draft PRs, including ready-for-review events
-
-Main requires a PR and successful checks, with force pushes and deletion disabled
 
 ## Configuration and data
 
@@ -39,19 +24,24 @@ Incomplete current data must fail, while unavailable history yields `N/A`
 
 ## Formulas
 
-Use current balance `B`, previous balance `P`, and actual elapsed days `d`
+Use current balance `B`, previous balance `P`, elapsed days `d`, and signed external flows `F` weighted by the remaining fraction of the interval `w`
 
 ```text
-APY (%)     = ((B / P)^(365 / d) - 1) * 100
-Daily Gain  = B * ((B / P)^(1 / d) - 1)
-Annual Gain = B * ((B / P)^(365 / d) - 1)
+R           = (B - P - sum(F)) / (P + sum(F * w))
+APY (%)     = ((1 + R)^(365 / d) - 1) * 100
+Daily Gain  = B * ((1 + R)^(1 / d) - 1)
+Annual Gain = B * ((1 + R)^(365 / d) - 1)
 ```
 
-Zero `P` yields `N/A`, while zero `B` with positive `P` yields -100% APY and zero projected gains
+Use the Modified Dietz approximation with complete NearBlocks receipt history between the pinned blocks, following cursors and deduplicating receipt IDs
 
-Preserve zero and negative growth without fixed rates
+Count successful external transfers and attached call deposits, excluding self transfers, discovered staking pools, and system refunds
 
-Transfers and fees affect these estimates because cash flows are not reconstructed
+Unavailable or invalid history, unsupported account deletions, and weighted capital at or below the eight decimal balance precision yield `N/A` without falling back to unadjusted balance growth
+
+These are estimates of total account growth after fees and other balance effects, not a guaranteed staking yield, and depend on the indexer having complete receipt data
+
+Keep zero and negative adjusted growth, treating residuals below the eight decimal balance precision as zero
 
 ## Dependencies and formatting
 

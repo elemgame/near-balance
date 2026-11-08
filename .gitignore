@@ -1,0 +1,8 @@
+# Downloaded CLI and generated quality reports
+/.quality-bash/
+/quality-reports/
+/quality-baseline.json.lock
+
+# Local editor settings and notes
+/.idea/
+/local.md

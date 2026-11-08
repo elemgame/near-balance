@@ -1,5 +1,5 @@
 <h1 align="center">near-balance</h1>
-<p align="center">NEAR balance and estimated growth from 30-day history</p>
+<p align="center">NEAR balance and estimated growth adjusted for external transfers</p>
 
 ## Install
 
@@ -48,3 +48,5 @@ APY         4.92%
 ```
 
 See [contributing.md](contributing.md) for development and formulas
+
+Growth estimates use roughly 30 days of balances and NearBlocks transfer history, with N/A when that history is unavailable

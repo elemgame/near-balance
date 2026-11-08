@@ -27,9 +27,9 @@
     }
   },
   "coverage": {
-    "linePercent": 0
+    "linePercent": 70.80
   },
   "mutation": {
-    "score": 0
+    "score": 70.45
   }
 }

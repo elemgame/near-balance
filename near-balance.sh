@@ -193,6 +193,68 @@ historical_block() {
     return 1
 }
 
+# Read all receipts across the interval before adjusting returns for external transfers
+cash_flows() {
+    local cursor='' seen='' page rows next oldest aggregate='[]' attempt
+    for ((attempt=0; attempt<100; attempt++)); do
+        page=$(curl -fsS --connect-timeout 5 --max-time 20 -G \
+            "https://api.nearblocks.io/v1/account/$ACCOUNT_PATH/txns" \
+            --data-urlencode 'per_page=100' --data-urlencode 'order=desc' \
+            --data-urlencode "cursor=$cursor") || return 1
+        rows=$(jq -ce --arg account "$ACCOUNT" -f /dev/fd/3 3<<'JQ' <<< "$page"
+            select(has("cursor")) | .txns | select(type == "array") |
+            select(all(.[];
+                (.receipt_id | type == "string" and length > 0) and
+                (.receipt_block.block_height | type == "number" and . > 0) and
+                (.receipt_block.block_timestamp | type == "number" and . > 0) and
+                (.receipt_outcome.status | type == "boolean") and
+                (.predecessor_account_id | type == "string") and
+                (.receiver_account_id | type == "string") and
+                (.predecessor_account_id == $account or .receiver_account_id == $account) and
+                (.actions | type == "array") and
+                all(.actions[];
+                    (.action | type == "string") and
+                    (if .action == "TRANSFER" or .action == "FUNCTION_CALL" then
+                        (.deposit | type == "number" and isfinite and . >= 0) else true end)))) |
+            select([.[].receipt_block.block_height] == ([.[].receipt_block.block_height] | sort | reverse))
+JQ
+        ) || return 1
+        aggregate=$(printf '%s\n' "$aggregate" "$rows" | jq -cs 'add | unique_by(.receipt_id)') || return 1
+        oldest=$(printf '%s' "$rows" | jq -r 'map(.receipt_block.block_height) | min // 0') || return 1
+        next=$(printf '%s' "$page" | jq -er 'if .cursor == null then "" else .cursor | select(type == "string" and test("^[0-9]+$")) end') || return 1
+        if [[ "$rows" == "[]" && -n "$next" ]]; then return 1; fi
+        if (( oldest <= OLD_HEIGHT )) || [[ -z "$next" ]]; then
+            local -a flow_args=(--arg account "$ACCOUNT" --arg pools "$POOLS"
+                --argjson start "$OLD_HEIGHT" --argjson end "$CURRENT_HEIGHT"
+                --argjson begin "$OLD_TS" --argjson finish "$CURRENT_TS")
+            rows=$(jq -er "${flow_args[@]}" -f /dev/fd/3 3<<'JQ' <<< "$aggregate"
+                ($pools | split("\n")) as $internal |
+                [.[] | select(.receipt_block.block_height > $start and .receipt_block.block_height <= $end) |
+                    select(.receipt_outcome.status) |
+                    . as $receipt |
+                    (if .predecessor_account_id == $account then .receiver_account_id else .predecessor_account_id end) as $other |
+                    select($other != $account and $other != "system" and ($internal | index($other) | not)) |
+                    .actions[] |
+                    if .action == "DELETE_ACCOUNT" then error("Unsupported account deletion") else . end |
+                    select(.action == "TRANSFER" or .action == "FUNCTION_CALL") |
+                    {amount: (.deposit / 1e24 * (if $receipt.receiver_account_id == $account then 1 else -1 end)),
+                     time: ($receipt.receipt_block.block_timestamp / 1e9)}] |
+                select(all(.[]; .time >= $begin and .time <= $finish + 1)) |
+                [(map(.amount) | add // 0),
+                 (map(.amount * (([$finish - .time, 0] | max) / ($finish - $begin))) | add // 0)] |
+                select(all(.[]; isfinite)) | @tsv
+JQ
+            ) || return 1
+            printf '%s\n' "$rows"
+            return 0
+        fi
+        [[ "|$seen|" != *"|$next|"* ]] || return 1
+        seen="${seen:+$seen|}$next"
+        cursor="$next"
+    done
+    return 1
+}
+
 # 2 Query a current summary, then pin all pool queries to the same block
 for dependency in curl jq timeout; do
     if ! command -v "$dependency" >/dev/null; then
@@ -245,7 +307,7 @@ if ! TOTAL_NEAR=$(complete_balance "$CLEAN_OUTPUT" "$BLOCK_NUM"); then
     exit 1
 fi
 
-# 3 Estimate compound growth from total balances approximately 30 days apart
+# 3 Estimate compound growth after weighting external cash flows by time
 DAILY_GAIN='N/A'
 ANNUAL_GAIN='N/A'
 APY='N/A'
@@ -267,20 +329,29 @@ if CURRENT_INFO=$(retry_read current_block); then
         read -r OLD_HEIGHT OLD_TS OLD_HASH OLD_TOTAL <<< "$OLD_INFO"
         save_history "$OLD_HEIGHT" "$OLD_TS" "$OLD_HASH" "$OLD_TOTAL" 2>/dev/null || true
         ELAPSED=$((CURRENT_TS - OLD_TS))
-        if GROWTH=$(awk -v current="$TOTAL_NEAR" -v previous="$OLD_TOTAL" -v dt="$ELAPSED" '
-            BEGIN {
-                if (previous <= 0 || current < 0 || dt < 30*86400 || dt > 31*86400) exit 1
-                if (current == 0) { print "0.0000 0.00 -100.00"; exit }
-                rate = log(current / previous) / dt
-                if (rate * 365 * 86400 > 600) exit 1
-                daily = current * (exp(rate * 86400) - 1)
-                annual_rate = exp(rate * 365 * 86400) - 1
-                printf "%+.4f %+.2f %.2f\n", daily, current * annual_rate, 100 * annual_rate
-            }'); then
-            read -r DAILY_GAIN ANNUAL_GAIN APY <<< "$GROWTH"
-            DAILY_GAIN="$DAILY_GAIN \$NEAR"
-            ANNUAL_GAIN="$ANNUAL_GAIN \$NEAR"
-            APY="$APY%"
+        if FLOWS=$(retry_read cash_flows); then
+            read -r NET_FLOW WEIGHTED_FLOW <<< "$FLOWS"
+            if GROWTH=$(awk -v flow="$NET_FLOW" -v weighted="$WEIGHTED_FLOW" -v current="$TOTAL_NEAR" -v previous="$OLD_TOTAL" -v dt="$ELAPSED" '
+                BEGIN {
+                    if (previous <= 0 || current < 0 || dt < 30*86400 || dt > 31*86400) exit 1
+                    capital = previous + weighted
+                    if (capital <= 1e-8) exit 1
+                    profit = current - previous - flow
+                    if (profit > -1e-8 && profit < 1e-8) profit = 0
+                    growth = 1 + profit / capital
+                    if (growth < 0) exit 1
+                    if (growth == 0) { printf "%.4f %.2f -100.00", 0-current, 0-current; exit }
+                    rate = log(growth) / dt
+                    if (rate * 365 * 86400 > 600) exit 1
+                    daily = current * (exp(rate * 86400) - 1)
+                    annual_rate = exp(rate * 365 * 86400) - 1
+                    printf "%+.4f %+.2f %.2f\n", daily, current * annual_rate, 100 * annual_rate
+                }'); then
+                read -r DAILY_GAIN ANNUAL_GAIN APY <<< "$GROWTH"
+                DAILY_GAIN="$DAILY_GAIN \$NEAR"
+                ANNUAL_GAIN="$ANNUAL_GAIN \$NEAR"
+                APY="$APY%"
+            fi
         fi
     fi
     save_history "$CURRENT_HEIGHT" "$CURRENT_TS" "$CURRENT_HASH" "$TOTAL_NEAR" 2>/dev/null || true

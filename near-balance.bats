@@ -1,16 +1,157 @@
 #!/usr/bin/env bats
+setup_file() {
+    mkdir -p "$BATS_FILE_TMPDIR/helpers"
+    cat > "$BATS_FILE_TMPDIR/helpers/curl" <<'HELPER_CURL'
+#!/usr/bin/env bash
+set -eu
+if [[ "$*" == *api.nearblocks.io* ]]; then
+    printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/flows.calls"
+    [[ "${FLOW_FAILURE:-}" != 1 ]] || exit 28
+    if [[ "$*" == *cursor=123* ]]; then
+        printf '%s\n' "${FLOW_SECOND:-}"
+    else
+        if [[ -n "${FLOW_RESPONSE:-}" ]]; then
+            printf '%s\n' "$FLOW_RESPONSE"
+        else
+            printf '%s\n' '{"txns":[],"cursor":null}'
+        fi
+    fi
+    exit
+fi
+if [[ "$*" == *api.fastnear.com/v1/account/* ]]; then
+    if [[ "${POOL_DISCOVERY_FAILURE:-}" == 1 ]]; then exit 1; fi
+    if [[ "${NO_POOLS:-}" == 1 ]]; then
+        printf '%s\n' '{"account_id":"example.near","pools":[]}'
+        exit
+    fi
+    printf '%s\n' '{"account_id":"example.near","pools":[{"pool_id":"pool.near"}]}'
+    exit
+fi
+if [[ "$*" == *archival-rpc.mainnet.fastnear.com* ]]; then
+    if [[ "${RPC_FAILURE:-}" == 1 ]]; then exit 1; fi
+    while [[ "$1" != --data ]]; do shift; done
+    height=$(printf '%s' "$2" | jq -r '.params.block_id')
+    printf '%s\n' "$height" >> "$BATS_TEST_TMPDIR/blocks.calls"
+    if [[ "${SKIPPED_BLOCK:-}" == 1 && "$height" == 111192670 ]]; then
+        printf '%s\n' '{"error":{"cause":{"name":"UNKNOWN_BLOCK"}}}'
+        exit
+    fi
+    timestamp=$((1793400000 - (222385340 - height) * ${BLOCK_SECONDS:-1}))
+    jq -cn --argjson height "$height" --arg timestamp "${timestamp}000000000" \
+        '{result:{header:{height:$height,timestamp_nanosec:$timestamp,hash:"3LbJoQaZCUskZYKfeUoDMbxEqH4pvp3rmmY4avdKvE8G"}}}'
+    exit
+fi
+printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/curl.calls"
+[[ "$*" == *https://api.exchange.coinbase.com/products/NEAR-USD/* ]] || exit 97
+[[ "$*" != *'-H '* ]] || exit 93
+[[ "${PRICE_NETWORK_FAILURE:-}" != 1 ]] || exit 28
+if [[ -n "${PRICE_RESPONSE:-}" ]]; then
+    printf '%s\n' "$PRICE_RESPONSE"
+elif [[ "$*" == */ticker* ]]; then
+    printf '%s\n' '{"price":"3.25","bid":"3.24","ask":"3.26"}'
+else
+    day=''
+    for arg in "$@"; do
+        if [[ "$arg" == start=* ]]; then day="${arg#start=}"; fi
+    done
+    timestamp=$(date -u -d "$day" +%s)
+    jq -cn --argjson timestamp "$timestamp" '[[$timestamp,1,3,1.5,2,100]]'
+fi
+HELPER_CURL
+    cat > "$BATS_FILE_TMPDIR/helpers/date" <<'HELPER_DATE'
+#!/usr/bin/env bash
+# Freeze the default price day without changing other date operations
+if [[ -n "${TEST_TODAY:-}" && "$*" == '-u -d yesterday +%Y-%m-%d' ]]; then
+    command -p date -u -d "$TEST_TODAY -1 day" +%Y-%m-%d
+else
+    command -p date "$@"
+fi
+HELPER_DATE
+    cat > "$BATS_FILE_TMPDIR/helpers/near" <<'HELPER_NEAR'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/near.calls"
+if [[ "$*" == *'config show-connections'* ]]; then
+    [[ "${CONFIG_READ_FAILURE:-}" != 1 ]] || exit 1
+    rpc="${CONFIG_RPC-https://archival-rpc.mainnet.fastnear.com/}"
+    if [[ -f "$BATS_TEST_TMPDIR/config.rpc" ]]; then
+        rpc=$(cat "$BATS_TEST_TMPDIR/config.rpc")
+    fi
+    cat >&2 <<CONFIG
+[network_connection.testnet]
+rpc_url = "https://archival-rpc.testnet.fastnear.com/"
+[network_connection.mainnet]
+rpc_url = "$rpc"
+[network_connection.mainnet-fastnear]
+rpc_url = "https://rpc.mainnet.fastnear.com/"
+CONFIG
+    exit
+fi
+if [[ "$*" == *'config edit-connection'* ]]; then
+    [[ "${CONFIG_WRITE_FAILURE:-}" != 1 ]] || exit 1
+    [[ "$*" == '--quiet config edit-connection mainnet --key rpc_url --value https://archival-rpc.mainnet.fastnear.com/' ]] || exit 96
+    printf '%s\n' "${*: -1}" > "$BATS_TEST_TMPDIR/config.rpc"
+    exit
+fi
+if [[ "$*" == *get_account_total_balance* ]]; then
+    [[ "${POOL_QUERY_FAILURE:-}" != 1 ]] || exit 1
+    # Include unstaked funds in the same total as active stake
+    printf '"%s"\n' "${POOL_TOTAL_YOCTO:-6500000000000000000000000}"
+    exit
+fi
+height="${CURRENT_BLOCK:-222385340}"
+native="${CURRENT_NATIVE:-12.5}"
+validator="${CURRENT_VALIDATOR:-1}"
+if [[ "$*" == *at-block-height* ]]; then
+    if [[ -n "${HISTORY_FAIL_COUNT:-}" ]]; then
+        attempts=0
+        if [[ -f "$BATS_TEST_TMPDIR/history.attempts" ]]; then
+            read -r attempts < "$BATS_TEST_TMPDIR/history.attempts"
+        fi
+        attempts=$((attempts + 1))
+        printf '%s\n' "$attempts" > "$BATS_TEST_TMPDIR/history.attempts"
+        if (( attempts <= HISTORY_FAIL_COUNT )); then exit 1; fi
+    fi
+    [[ "${HISTORICAL_FAILURE:-}" != 1 ]] || exit 1
+    height="${*: -1}"
+    native="${OLD_NATIVE:-12.3}"
+    validator="${OLD_VALIDATOR:-1}"
+    if [[ "${WRONG_OLD_BLOCK:-}" == 1 ]]; then height=1; fi
+fi
+cat >&2 <<REPORT
+example.near At block #$height
+(3LbJoQaZCUskZYKfeUoDMbxEqH4pvp3rmmY4avdKvE8G)
+Native account balance $native NEAR
+Validator stake $validator NEAR
+Delegated stake with <pool.near> 6.5 NEAR
+REPORT
+HELPER_NEAR
+    cat > "$BATS_FILE_TMPDIR/helpers/npm" <<'HELPER_NPM'
+#!/usr/bin/env bash
+printf '%s\n' 'Unexpected npm invocation' >&2
+exit 99
+HELPER_NPM
+    cat > "$BATS_FILE_TMPDIR/helpers/sleep" <<'HELPER_SLEEP'
+#!/usr/bin/env bash
+printf "%s\n" "$*" >> "$BATS_TEST_TMPDIR/sleep.calls"
+HELPER_SLEEP
+    chmod +x "$BATS_FILE_TMPDIR/helpers/"*
+}
+
 setup() {
     bats_require_minimum_version 1.5.0
-    export PATH="$BATS_TEST_DIRNAME/helpers:$PATH"
+    export PATH="$BATS_FILE_TMPDIR/helpers:$PATH"
     export XDG_CACHE_HOME="$BATS_TEST_TMPDIR/cache"
     unset NO_COLOR PRICE_NETWORK_FAILURE TEST_TODAY
     unset PRICE_RESPONSE HISTORICAL_FAILURE RPC_FAILURE
+    unset CURRENT_BLOCK
     unset CURRENT_NATIVE OLD_NATIVE POOL_TOTAL_YOCTO POOL_QUERY_FAILURE POOL_DISCOVERY_FAILURE
     unset CURRENT_VALIDATOR OLD_VALIDATOR WRONG_OLD_BLOCK SKIPPED_BLOCK BLOCK_SECONDS NO_POOLS
     unset CONFIG_RPC CONFIG_READ_FAILURE CONFIG_WRITE_FAILURE NEAR_BALANCE_RPC_URL
     export HOME="$BATS_TEST_TMPDIR/home"
+    unset FLOW_RESPONSE FLOW_SECOND FLOW_FAILURE
     unset HISTORY_FAIL_COUNT
-    SCRIPT="$BATS_TEST_DIRNAME/../near-balance.sh"
+    SCRIPT="$BATS_TEST_DIRNAME/near-balance.sh"
 }
 
 @test "missing account and excess arguments print usage" {
@@ -57,7 +198,7 @@ setup() {
 }
 @test "missing near fails without attempting package installation" {
     mkdir -p "$BATS_TEST_TMPDIR/bin"
-    ln -s "$BATS_TEST_DIRNAME/helpers/npm" "$BATS_TEST_TMPDIR/bin/npm"
+    ln -s "$BATS_FILE_TMPDIR/helpers/npm" "$BATS_TEST_TMPDIR/bin/npm"
     run env PATH="$BATS_TEST_TMPDIR/bin" /bin/bash "$SCRIPT" example.near
     [ "$status" -eq 1 ]
     [[ "$output" == 'Error: install the required near-cli-rs as described in the README' ]]
@@ -313,4 +454,157 @@ setup() {
     run bash "$SCRIPT" example.near
     [ "$status" -eq 0 ]
     [[ "$output" != *'APY         N/A'* ]]
+}
+
+seed_flow_history() {
+    mkdir -p "$HOME/.near-balance"
+    printf '%s\n' '{"version":1,"account":"example.near","network":"mainnet","snapshots":[{"height":219793340,"timestamp":1790808000,"hash":"3LbJoQaZCUskZYKfeUoDMbxEqH4pvp3rmmY4avdKvE8G","balance":"20.00000000"}]}' > "$HOME/.near-balance/example.near-history.json"
+}
+flow_response() {
+    jq -cn --argjson amount "$1" --arg from "$2" --arg to "$3" '
+        {cursor:null,txns:[{
+            receipt_id:"receipt-one",predecessor_account_id:$from,receiver_account_id:$to,
+            receipt_block:{block_height:222000000,block_timestamp:1792104000000000000},
+            receipt_outcome:{status:true},actions:[{action:"TRANSFER",deposit:($amount*1e24)}]
+        }]}'
+}
+@test "external withdrawals do not create negative APY" {
+    export CURRENT_NATIVE=2.5 OLD_NATIVE=12.5
+    FLOW_RESPONSE=$(flow_response 10 example.near recipient.near)
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+    [[ "$output" == *'Daily Gain  +0.0000 $NEAR'* ]]
+    [[ "$output" == *'Annual Gain +0.00 $NEAR'* ]]
+}
+@test "external deposits do not create positive APY" {
+    export CURRENT_NATIVE=22.5 OLD_NATIVE=12.5
+    FLOW_RESPONSE=$(flow_response 10 sender.near example.near)
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+}
+@test "cash flow timing weights capital in the return estimate" {
+    seed_flow_history
+    export CURRENT_NATIVE=3.5
+    FLOW_RESPONSE=$(flow_response 10 example.near recipient.near)
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'Daily Gain  +0.0237 $NEAR'* ]]
+    [[ "$output" == *'Annual Gain +13.12 $NEAR'* ]]
+    [[ "$output" == *'APY         119.29%'* ]]
+}
+@test "internal pool transfers self transfers and gas refunds are not external flows" {
+    export OLD_NATIVE=12.5
+    for pair in 'pool.near example.near' 'example.near pool.near' 'system example.near' 'example.near example.near'; do
+        read -r from to <<< "$pair"
+        FLOW_RESPONSE=$(flow_response 200 "$from" "$to")
+        export FLOW_RESPONSE
+        run bash "$SCRIPT" example.near
+        [ "$status" -eq 0 ]
+        [[ "$output" == *'APY         0.00%'* ]]
+    done
+}
+@test "unavailable or malformed flow history cannot produce APY" {
+    for response in '{}' '<html>error</html>' '{"cursor":"123","txns":[]}' '{"cursor":null,"txns":[{}]}'; do
+        export FLOW_RESPONSE="$response"
+        run bash "$SCRIPT" example.near
+        [ "$status" -eq 0 ]
+        [[ "$output" == *'Daily Gain  N/A'* ]]
+        [[ "$output" == *'Annual Gain N/A'* ]]
+        [[ "$output" == *'APY         N/A'* ]]
+    done
+    export FLOW_FAILURE=1
+    run bash "$SCRIPT" example.near
+    [[ "$output" == *'APY         N/A'* ]]
+}
+@test "flow pagination removes overlapping receipts and stops on a complete history" {
+    export CURRENT_NATIVE=2.5 OLD_NATIVE=12.5
+    FLOW_RESPONSE=$(flow_response 10 example.near recipient.near | jq '.cursor="123"')
+    FLOW_SECOND=$(flow_response 10 example.near recipient.near)
+    export FLOW_RESPONSE FLOW_SECOND
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+    [[ "$(cat "$BATS_TEST_TMPDIR/flows.calls")" == *cursor=123* ]]
+}
+@test "repeated flow cursors fail closed" {
+    FLOW_RESPONSE=$(flow_response 10 example.near recipient.near | jq '.cursor="123"')
+    export FLOW_RESPONSE FLOW_SECOND="$FLOW_RESPONSE"
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         N/A'* ]]
+}
+
+@test "failed and out of interval receipts cannot affect return" {
+    seed_flow_history
+    export OLD_NATIVE=12.5
+    for change in '.txns[0].receipt_outcome.status=false' '.txns[0].receipt_block.block_height=219793340' '.txns[0].receipt_block.block_height=222385341'; do
+        FLOW_RESPONSE=$(flow_response 10 example.near recipient.near | jq "$change")
+        export FLOW_RESPONSE
+        run bash "$SCRIPT" example.near
+        [ "$status" -eq 0 ]
+        [[ "$output" == *'APY         0.00%'* ]]
+    done
+}
+@test "attached deposits are external flows and malformed monetary amounts fail closed" {
+    seed_flow_history
+    export CURRENT_NATIVE=2.5
+    FLOW_RESPONSE=$(flow_response 10 example.near app.near | jq '.txns[0].actions[0].action="FUNCTION_CALL"')
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+    for change in '.txns[0].actions[0].deposit=null' '.txns[0].actions[0].deposit=-1' '.txns[0].actions[0].action="DELETE_ACCOUNT"' 'del(.cursor)'; do
+        FLOW_RESPONSE=$(flow_response 10 example.near app.near | jq "$change")
+        export FLOW_RESPONSE
+        run bash "$SCRIPT" example.near
+        [ "$status" -eq 0 ]
+        [[ "$output" == *'APY         N/A'* ]]
+    done
+}
+@test "nonpositive weighted capital or negative growth factor yields N/A" {
+    seed_flow_history
+    export CURRENT_NATIVE=0 CURRENT_VALIDATOR=0 POOL_TOTAL_YOCTO=0
+    FLOW_RESPONSE=$(flow_response 40 example.near recipient.near)
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [[ "$output" == *'APY         N/A'* ]]
+    FLOW_RESPONSE=$(flow_response 100 sender.near example.near)
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [[ "$output" == *'APY         N/A'* ]]
+}
+@test "pure withdrawal of all funds preserves zero return" {
+    seed_flow_history
+    export CURRENT_NATIVE=0 CURRENT_VALIDATOR=0 POOL_TOTAL_YOCTO=0
+    FLOW_RESPONSE=$(flow_response 20 example.near recipient.near)
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+    [[ "$output" == *'Daily Gain  +0.0000 $NEAR'* ]]
+}
+
+@test "missing required dependencies fail before account reads" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    ln -s "$BATS_FILE_TMPDIR/helpers/near" "$BATS_TEST_TMPDIR/bin/near"
+    for dependency in curl jq timeout; do
+        run env PATH="$BATS_TEST_TMPDIR/bin" /bin/bash "$SCRIPT" example.near now
+        [ "$status" -eq 1 ]
+        [[ "$output" == "Error: $dependency is required" ]]
+        [ ! -e "$BATS_TEST_TMPDIR/near.calls" ]
+        ln -s /bin/true "$BATS_TEST_TMPDIR/bin/$dependency"
+    done
+}
+@test "invalid current block fails before staking or price queries" {
+    export CURRENT_BLOCK=invalid
+    run bash "$SCRIPT" example.near now
+    [ "$status" -eq 1 ]
+    [[ "$output" == 'Error: could not read the account block' ]]
+    [ ! -e "$BATS_TEST_TMPDIR/flows.calls" ]
+    [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
 }

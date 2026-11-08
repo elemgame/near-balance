@@ -1,19 +1,18 @@
 name: QA
 on:
-  push:
-    branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - near-balance.sh
+      - near-balance.bats
 permissions:
   contents: read
 jobs:
   qa:
     name: Lint and test
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
-          persist-credentials: false
-      - run: make toolchain
-      - run: make qa
+          fetch-depth: 0
+      - uses: ever-guild/quality-bash@v1.0.0-alpha.5
