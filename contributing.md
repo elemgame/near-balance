@@ -33,7 +33,7 @@ Daily Gain  = B * ((1 + R)^(1 / d) - 1)
 Annual Gain = B * ((1 + R)^(365 / d) - 1)
 ```
 
-Use the Modified Dietz approximation with complete NearBlocks receipt history between the pinned blocks, following cursors and deduplicating receipt IDs
+Use the Modified Dietz approximation with complete NearBlocks receipt history between the pinned blocks, using `/receipts` filtered by execution dates, following every cursor to the terminal page and deduplicating receipt IDs
 
 Count successful external transfers and attached call deposits, excluding self transfers, discovered staking pools, and system refunds
 

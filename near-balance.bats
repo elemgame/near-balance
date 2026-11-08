@@ -13,7 +13,7 @@ if [[ "$*" == *api.nearblocks.io* ]]; then
         if [[ -n "${FLOW_RESPONSE:-}" ]]; then
             printf '%s\n' "$FLOW_RESPONSE"
         else
-            printf '%s\n' '{"txns":[],"cursor":null}'
+            printf '%s\n' '{"txns":[]}'
         fi
     fi
     exit
@@ -558,7 +558,7 @@ flow_response() {
     run bash "$SCRIPT" example.near
     [ "$status" -eq 0 ]
     [[ "$output" == *'APY         0.00%'* ]]
-    for change in '.txns[0].actions[0].deposit=null' '.txns[0].actions[0].deposit=-1' '.txns[0].actions[0].action="DELETE_ACCOUNT"' 'del(.cursor)'; do
+    for change in '.txns[0].actions[0].deposit=null' '.txns[0].actions[0].deposit=-1' '.txns[0].actions[0].action="DELETE_ACCOUNT"' '.cursor=false' '.cursor=123' '.cursor=""'; do
         FLOW_RESPONSE=$(flow_response 10 example.near app.near | jq "$change")
         export FLOW_RESPONSE
         run bash "$SCRIPT" example.near
@@ -607,4 +607,48 @@ flow_response() {
     [[ "$output" == 'Error: could not read the account block' ]]
     [ ! -e "$BATS_TEST_TMPDIR/flows.calls" ]
     [ ! -e "$BATS_TEST_TMPDIR/curl.calls" ]
+}
+
+@test "terminal receipt pages accept an omitted or null cursor" {
+    seed_flow_history
+    export CURRENT_NATIVE=2.5
+    for change in 'del(.cursor)' '.cursor=null'; do
+        FLOW_RESPONSE=$(flow_response 10 example.near recipient.near | jq "$change")
+        export FLOW_RESPONSE
+        run bash "$SCRIPT" example.near
+        [ "$status" -eq 0 ]
+        [[ "$output" == *'APY         0.00%'* ]]
+    done
+    export CURRENT_NATIVE=12.5 FLOW_RESPONSE='{"txns":[]}'
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+}
+
+@test "receipt history tolerates execution heights outside transaction order" {
+    seed_flow_history
+    export CURRENT_NATIVE=2.5
+    FLOW_RESPONSE=$(flow_response 10 example.near recipient.near | jq '
+        del(.cursor) | .txns = [(.txns[0] | .receipt_id="old" | .receipt_block.block_height=219793340), .txns[0]]')
+    export FLOW_RESPONSE
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+    calls=$(cat "$BATS_TEST_TMPDIR/flows.calls")
+    [[ "$calls" == *'/account/example.near/receipts'* ]]
+    [[ "$calls" == *'after_date=2026-09-29'* ]]
+    [[ "$calls" == *'before_date=2026-10-31'* ]]
+}
+
+@test "an old receipt cannot stop pagination before a delayed in range receipt" {
+    seed_flow_history
+    export CURRENT_NATIVE=2.5
+    FLOW_RESPONSE=$(flow_response 200 example.near recipient.near | jq '
+        .cursor="123" | .txns[0].receipt_id="old" | .txns[0].receipt_block.block_height=219793340')
+    FLOW_SECOND=$(flow_response 10 example.near recipient.near | jq 'del(.cursor)')
+    export FLOW_RESPONSE FLOW_SECOND
+    run bash "$SCRIPT" example.near
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'APY         0.00%'* ]]
+    [[ "$(cat "$BATS_TEST_TMPDIR/flows.calls")" == *cursor=123* ]]
 }

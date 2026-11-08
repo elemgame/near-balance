@@ -195,14 +195,17 @@ historical_block() {
 
 # Read all receipts across the interval before adjusting returns for external transfers
 cash_flows() {
-    local cursor='' seen='' page rows next oldest aggregate='[]' attempt
+    local cursor='' seen='' page rows next aggregate='[]' attempt after_date before_date
+    after_date=$(date -u -d "@$((OLD_TS - 86400))" +%F) || return 1
+    before_date=$(date -u -d "@$((CURRENT_TS + 86400))" +%F) || return 1
     for ((attempt=0; attempt<100; attempt++)); do
         page=$(curl -fsS --connect-timeout 5 --max-time 20 -G \
-            "https://api.nearblocks.io/v1/account/$ACCOUNT_PATH/txns" \
+            "https://api.nearblocks.io/v1/account/$ACCOUNT_PATH/receipts" \
             --data-urlencode 'per_page=100' --data-urlencode 'order=desc' \
+            --data-urlencode "after_date=$after_date" --data-urlencode "before_date=$before_date" \
             --data-urlencode "cursor=$cursor") || return 1
         rows=$(jq -ce --arg account "$ACCOUNT" -f /dev/fd/3 3<<'JQ' <<< "$page"
-            select(has("cursor")) | .txns | select(type == "array") |
+            .txns | select(type == "array") |
             select(all(.[];
                 (.receipt_id | type == "string" and length > 0) and
                 (.receipt_block.block_height | type == "number" and . > 0) and
@@ -215,15 +218,13 @@ cash_flows() {
                 all(.actions[];
                     (.action | type == "string") and
                     (if .action == "TRANSFER" or .action == "FUNCTION_CALL" then
-                        (.deposit | type == "number" and isfinite and . >= 0) else true end)))) |
-            select([.[].receipt_block.block_height] == ([.[].receipt_block.block_height] | sort | reverse))
+                        (.deposit | type == "number" and isfinite and . >= 0) else true end))))
 JQ
         ) || return 1
         aggregate=$(printf '%s\n' "$aggregate" "$rows" | jq -cs 'add | unique_by(.receipt_id)') || return 1
-        oldest=$(printf '%s' "$rows" | jq -r 'map(.receipt_block.block_height) | min // 0') || return 1
         next=$(printf '%s' "$page" | jq -er 'if .cursor == null then "" else .cursor | select(type == "string" and test("^[0-9]+$")) end') || return 1
         if [[ "$rows" == "[]" && -n "$next" ]]; then return 1; fi
-        if (( oldest <= OLD_HEIGHT )) || [[ -z "$next" ]]; then
+        if [[ -z "$next" ]]; then
             local -a flow_args=(--arg account "$ACCOUNT" --arg pools "$POOLS"
                 --argjson start "$OLD_HEIGHT" --argjson end "$CURRENT_HEIGHT"
                 --argjson begin "$OLD_TS" --argjson finish "$CURRENT_TS")
