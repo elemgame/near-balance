@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/ever-guild/quality-bash/v1.0.0-alpha.3/baseline.schema.json",
+  "files": [
+    "near-balance.sh"
+  ],
+  "method": {
+    "coverage": {
+      "algorithm": "kcov-ps4-cobertura-lines-v1"
+    },
+    "mutation": {
+      "algorithm": "bash-ast-v1",
+      "operators": [
+        "condition",
+        "arithmetic",
+        "return-code"
+      ],
+      "parser": {
+        "name": "mvdan.cc/sh/v3",
+        "version": "v3.12.0"
+      }
+    },
+    "tools": {
+      "bash": "5.2.21(1)-release",
+      "bats": "1.14.0",
+      "kcov": "43+dfsg-1~bpo12+1",
+      "shellcheck": "0.11.0"
+    }
+  },
+  "coverage": {
+    "linePercent": 0
+  },
+  "mutation": {
+    "score": 0
+  }
+}
